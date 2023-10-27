@@ -1,0 +1,103 @@
+on:
+  push:
+    branches:
+      - builder
+
+env:
+  PCAT_MANAGER_WEB_IPK_URL: https://dl.photonicat.com/repos/openwrt/r2307/volatile/pcat-manager-web_1.0.22-21_aarch64_generic.ipk
+
+jobs:
+  pcat-manager-web:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Pull previous versions
+        id: prev
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: feed
+
+      - name: Initialize first version
+        if: steps.prev.outcome == 'failure'
+        working-directory: feed
+        run: git checkout -b main
+
+      - name: Configure git repository
+        working-directory: feed
+        run: |
+          git config user.name photonicat
+          git config user.email info@photonicat.com
+
+      - name: Download and extract IPK
+        run: wget ${{ env.PCAT_MANAGER_WEB_IPK_URL}} -O- | tar xvzf -
+
+      - name: Extract files
+        run: |
+          tar xvzf control.tar.gz
+          rm -rf feed/net/pcat-manager-web/files
+          mkdir -p feed/net/pcat-manager-web/files
+          tar xvzf data.tar.gz -C feed/net/pcat-manager-web/files/
+
+      - name: Extract package info
+        id: info
+        run: |
+          echo "PKG_NAME=$(grep 'Package: ' control | awk -F ': ' '{print $2}')" >> $GITHUB_OUTPUT
+          echo "VERSION=$(grep 'Version: ' control | awk -F ': ' '{print $2}')" >> $GITHUB_OUTPUT
+
+      - name: Generate Makefile
+        shell: bash
+        run: |
+          DEPENDS_ARRAY=($(grep "Depends: " control | awk -F ': ' '{print $2}' | tr ',' '\n'))
+          for DEPEND in "${DEPENDS_ARRAY[@]}"; do
+              DEPENDS="$DEPENDS+$DEPEND "
+          done
+          cat << EOF > feed/net/pcat-manager-web/Makefile
+          include \$(TOPDIR)/rules.mk
+
+          PKG_NAME:=${{ steps.info.outputs.PKG_NAME }}
+          PKG_VERSION:=$(echo "${{ steps.info.outputs.VERSION }}" | cut -d- -f1)
+          PKG_RELEASE:=$(echo "${{ steps.info.outputs.VERSION }}" | cut -d- -f2)
+
+          PKG_SOURCE_DATE_EPOCH:=$(grep "SourceDateEpoch: " control | awk -F ': ' '{print $2}')
+
+          PKG_LICENSE:=$(grep "License: " control | awk -F ': ' '{print $2}')
+          PKG_LICENSE_FILES:=$(grep "LicenseFiles: " control | awk -F ': ' '{print $2}')
+
+          include \$(INCLUDE_DIR)/package.mk
+
+          define Package/${{ steps.info.outputs.PKG_NAME }}
+            SECTION:=net
+            CATEGORY:=Utilities
+            DEPENDS:=$DEPENDS
+            TITLE:=PCat System Manager Web
+            PROVIDES:=${{ steps.info.outputs.PKG_NAME }}
+          endef
+
+          define Package/${{ steps.info.outputs.PKG_NAME }}/description
+           $(grep "Description: " control | awk -F ': ' '{print $2}')
+          endef
+
+          define Package/${{ steps.info.outputs.PKG_NAME }}/install
+            \$(CP) ./files/* \$(1)/
+          endef
+
+          \$(eval \$(call BuildPackage,${{ steps.info.outputs.PKG_NAME }}))
+          EOF
+
+      - name: Detect changes
+        id: detect_changes
+        working-directory: feed
+        run: if [ -n "$(git status --porcelain)" ]; then echo "::set-output name=changes_detected::true"; fi
+
+      - name: Push back to repository
+        if: steps.detect_changes.outputs.changes_detected == 'true'
+        working-directory: feed
+        run: |
+          git config push.default simple
+          git add -A
+          git commit -m '${{ steps.info.outputs.PKG_NAME }}_${{ steps.info.outputs.VERSION }}'
+          git tag '${{ steps.info.outputs.PKG_NAME }}_${{ steps.info.outputs.VERSION }}'
+          git push --set-upstream origin main
+          git push --tags
